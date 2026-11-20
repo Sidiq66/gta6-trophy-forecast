@@ -4,7 +4,7 @@ Model in one paragraph: the page a case's history records only changes when Exop
 history collapses into refresh epochs (runs of identical reads). Inside an epoch nothing moves; between epochs
 two things happen at once: the tracked-player pool grows, which dilutes every earn rate, and the players keep
 playing, which grows each trophy's earner count. The two effects are separated by fitting them apart over the
-recent window (the last 36 h of epochs): a line for ln(players) against ln(1 + hours since release), and a
+recent window (the last 24 h of epochs): a line for ln(players) against ln(1 + hours since release), and a
 line per trophy for ln(earners), earners = rate / 100 * players, each slope damped for the read past the last
 epoch and the per-trophy slopes shrunk toward the whole game's earner slope. At the last observed rate the
 two slopes combine into the share's logit slope, (earner slope - pool slope) / (1 - share), and the median
@@ -44,9 +44,35 @@ TIER_PRIOR = {"platinum": 0.05, "gold": 0.4, "silver": 1.0, "bronze": 2.5}
 # unrepresentative, and a line fitted through it extrapolates absurdly. Slopes are also damped when read
 # past the last epoch (growth decelerates as the launch rush fades): the extrapolated change is the slope
 # times the log-time distance times (x_last / x_target) ** SLOPE_DAMP_EXP.
-FIT_WINDOW_HOURS = 36.0
-SLOPE_DAMP_EXP = 0.5
+FIT_WINDOW_HOURS = 24.0
+SLOPE_DAMP_EXP = 1.1
 SHRINK_WEIGHT = 3.0  # pseudo-count of the game's slope in each trophy's shrunk slope
+
+# Spread components on the logit scale (see forecast_case): the random-walk coefficient per sqrt(day)
+# of horizon, the model-form coefficient per unit of log-time distance extrapolated, and the rounding
+# floor. SIGMA_SCALE multiplies the combined spread; MOVE_SCALE multiplies the extrapolated logit move
+# of the median; BIAS_C0 + BIAS_C1 * share is subtracted from the median's logit (a recalibration for
+# the systematic overforecast of fast-saturating trophies). FROZEN_* set the spread when the history
+# holds a single epoch and nothing has ever been seen to move.
+#
+# Recalibration (2026-11-20, see RESULTS.md section 2): the first calibration ran far too wide and too
+# high -- on synthetic worlds the emitted sigma averaged ~0.49 logit against a realized error std of
+# ~0.19, coverage ran 0.99 against the 0.90 nominal, and the median overforecast by ~0.16 logit,
+# worst for high-share trophies whose earner curves had already saturated. The constants below were
+# re-fit against an extended synthetic suite (13 regimes: pool growth, refresh cadence, checkpoint and
+# target placement, earning-curve shape, rarity mix, a mid-window pool surge), accepting a change only
+# when it improved both the tuning and the held-out worlds of every regime: a shorter fit window (the
+# launch rush poisons a 36 h window), stronger slope damping with a small move shrink, a share-proportional
+# bias correction, and a spread rescale that lands coverage on its nominal 0.90.
+WALK_COEF = 0.10
+FORM_COEF = 0.22
+SIGMA_FLOOR = 0.04
+SIGMA_SCALE = 0.65
+MOVE_SCALE = 0.95
+BIAS_C0 = 0.0
+BIAS_C1 = 0.3
+FROZEN_WALK_COEF = 0.22
+FROZEN_FLOOR = 0.02
 
 
 def clamp_rate(pct: float) -> float:
@@ -291,7 +317,9 @@ def forecast_case(case):
             dist = max(0.0, x_target - anchor_x)
             if fit is not None:
                 sigma_extra = min(0.9, abs(fit.se_b) / max(0.02, 1.0 - share) * dist)
-            median_rate = clamp_rate(inv_logit(logit(last_rate) + slope_logit * damp * dist))
+            mu_med = logit(last_rate) + MOVE_SCALE * slope_logit * damp * dist \
+                - (BIAS_C0 + BIAS_C1 * share)
+            median_rate = clamp_rate(inv_logit(mu_med))
         elif obs:  # a single frozen epoch: nothing has been seen to move
             median_rate = clamp_rate(obs[-1][3])
             resid_logit = game_resid
@@ -304,11 +332,11 @@ def forecast_case(case):
         if len(epochs) >= 2:
             # walk + the series' own wiggle around its trend + slope uncertainty + pool-slope uncertainty
             # + a model-form term for the damped extrapolation + a floor for the page's rounding
-            var = (0.18 * math.sqrt(h_days)) ** 2 + resid_logit ** 2 + sigma_extra ** 2 \
-                + (pool_se * dx) ** 2 + (0.28 * dist) ** 2 + 0.04 ** 2
-            sigma = min(2.4, max(0.05, math.sqrt(var)))
+            var = (WALK_COEF * math.sqrt(h_days)) ** 2 + resid_logit ** 2 + sigma_extra ** 2 \
+                + (pool_se * dx) ** 2 + (FORM_COEF * dist) ** 2 + SIGMA_FLOOR ** 2
+            sigma = min(2.4, max(0.05, SIGMA_SCALE * math.sqrt(var)))
         else:  # frozen or empty history: nothing has been seen to move, so the interval stays tight
-            sigma = min(2.4, math.sqrt((0.30 * math.sqrt(h_days)) ** 2 + 0.03 ** 2))
+            sigma = min(2.4, math.sqrt((FROZEN_WALK_COEF * math.sqrt(h_days)) ** 2 + FROZEN_FLOOR ** 2))
         medians.append((i, median_rate))
         rows.append((trophy.get("id") if isinstance(trophy.get("id"), int) else i + 1, median_rate, sigma))
 

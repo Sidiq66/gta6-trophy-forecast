@@ -34,7 +34,7 @@ keeps them apart:
 - **Progression.** The players keep playing, so each trophy's earner count (`rate / 100 * players_tracked`)
   grows as cohorts reach it — fast for early story trophies, slow for endgame and online ones.
 
-Both sides are fitted separately over the recent window (the last 36 h of epochs; launch-hour growth is
+Both sides are fitted separately over the recent window (the last 24 h of epochs; launch-hour growth is
 explosive and unrepresentative): a line for `ln(players)` and a line per trophy for `ln(earners)`, each
 against `ln(1 + hours since release)`, each slope damped for the read past the last epoch because growth
 decelerates as the launch rush fades. Per-trophy earner slopes are shrunk toward the whole game's earner
@@ -57,12 +57,16 @@ kept finite, inside 0–100, and non-decreasing.
 ## Validation summary
 
 - Practice holdout (last read of each practice case held out; both histories are one frozen page, so this
-  measures spread discipline only): **model 0.0105** vs house persistence 0.0144 and house curve 0.0144, on
+  measures spread discipline only): **model 0.0075** vs house persistence 0.0144 and house curve 0.0144, on
   both cases.
 - Synthetic benchmark (cohort worlds with known ground truth, f00-shaped cases: checkpoint 59.5 h after
-  release, target at 168 h): **model 0.150** vs persistence 0.340 and curve 0.254 (mean over 5 worlds;
-  0.147 vs 0.322 / 0.260 on 5 further worlds held out from tuning).
-- Runtime contract: deterministic (byte-identical across runs and hash seeds), ~0.01 s on a 360-read case
+  release, target at 168 h): **model 0.110** vs persistence 0.340 and curve 0.254 (mean over 5 worlds;
+  0.096 vs 0.322 / 0.260 on 5 further worlds held out from tuning). A 13-regime extended suite (pool
+  growth, refresh cadence, checkpoint placement, earning-curve shape, rarity mix, a pool surge) averages
+  0.106 / 0.103 on tuning / held-out worlds; the model was recalibrated against it on 2026-11-20 after
+  diagnostics showed the first calibration running at 0.99 coverage with a systematic overforecast —
+  see RESULTS.md.
+- Runtime contract: deterministic (byte-identical across runs and hash seeds), ~0.1 s on a 360-read case
   against the 8 s cap, output ≈2.7 KB against the 65,536-byte cap.
 
 Full numbers and method notes: [RESULTS.md](RESULTS.md).

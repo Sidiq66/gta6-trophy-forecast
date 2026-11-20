@@ -250,6 +250,115 @@ def run_synthetic(seeds=(1, 2, 3, 4, 5)):
     return mean
 
 
+def synth_world_x(seed, pool_start=600.0, pool_add=80000.0, pool_tau=72.0, pool_exp=0.85,
+                  refresh_lo=2.5, refresh_hi=6.5, checkpoint_h=59.5, target_h=168.0,
+                  a_lo=0.01, a_hi=0.97, tau_lo=2.0, tau_hi=320.0, earn_exp=0.8,
+                  surge_h=None, surge_add=0.0):
+    """synth_world with the world's knobs exposed; the defaults reproduce synth_world exactly.
+
+    The knobs move one feature of the world at a time: how fast and how far the tracked pool grows,
+    how often the page refreshes, where the checkpoint and target sit, how common the trophies are,
+    how their earning curves bend, and a second pool wave (surge) partway through the window."""
+    rng = random.Random(seed)
+    trophies = []
+    for k in range(55):
+        if k == 0:
+            trophies.append({"id": 1, "name": "Platinum", "description": "all", "tier": "platinum",
+                             "points": 300, "secret": False, "_A": 0.004, "_tau": 260.0})
+            continue
+        tier = "gold" if k <= 2 else "silver" if k <= 8 else "bronze"
+        a = math.exp(rng.uniform(math.log(a_lo), math.log(a_hi)))
+        tau = math.exp(rng.uniform(math.log(tau_lo), math.log(tau_hi)))
+        trophies.append({"id": k + 1, "name": f"T{k + 1}", "description": "synthetic", "tier": tier,
+                         "points": {"gold": 90, "silver": 30, "bronze": 15}[tier],
+                         "secret": bool(rng.getrandbits(1)), "_A": a, "_tau": tau})
+
+    def pool(hours):
+        base = pool_start + pool_add * (1.0 - math.exp(-((hours / pool_tau) ** pool_exp)))
+        if surge_h is not None and hours > surge_h:
+            base += surge_add * (1.0 - math.exp(-((hours - surge_h) / 30.0)))
+        return base
+
+    refreshes = []
+    t = 0.0
+    while t < target_h + 10.0:
+        refreshes.append((t, pool(t)))
+        t += rng.uniform(refresh_lo, refresh_hi)
+
+    def state_at(hours):
+        step = max((s for s in refreshes if s[0] <= hours), key=lambda s: s[0])
+        n = step[1]
+        earners = []
+        for tr in trophies:
+            e = 0.0
+            for j, (s0, n0) in enumerate(refreshes):
+                if s0 > step[0]:
+                    break
+                cohort = n0 - (refreshes[j - 1][1] if j else 0.0)
+                age = step[0] - s0
+                e += cohort * tr["_A"] * (1.0 - math.exp(-((age / tr["_tau"]) ** earn_exp))) if age > 0 else 0.0
+            earners.append(e)
+        rates = [round(100.0 * e / n, 2) if n else 0.0 for e in earners]
+        return n, rates, sum(earners)
+
+    history = []
+    read_h = -0.17
+    while read_h < checkpoint_h:
+        n, rates, earned = state_at(max(read_h, 0.0))
+        history.append({"slot": iso(RELEASE + timedelta(hours=read_h)), "at": iso(RELEASE + timedelta(hours=read_h)),
+                        "players_tracked": int(round(n)), "trophies_earned": int(round(earned)), "rates": rates})
+        read_h += 0.5
+    case = {"schema": "makefun/gta6-trophies-case/v1", "id": f"s{seed}", "at": iso(RELEASE + timedelta(hours=checkpoint_h)),
+            "horizon_minutes": (target_h - checkpoint_h) * 60.0, "target": iso(RELEASE + timedelta(hours=target_h)),
+            "levels": LEVELS, "game": {"name": "Grand Theft Auto VI", "platform": "PS5",
+                                       "release_date": "2026-11-19", "source": "synthetic"},
+            "trophies": [{k: v for k, v in tr.items() if not k.startswith("_")} for tr in trophies],
+            "history": history, "notes": "synthetic"}
+    _, truth, _ = state_at(target_h)
+    return case, truth
+
+
+REGIMES = {
+    "base": {},
+    "fast_pool": {"pool_tau": 30.0, "pool_add": 150000.0},
+    "slow_pool": {"pool_tau": 150.0, "pool_add": 45000.0},
+    "small_pool": {"pool_start": 250.0, "pool_add": 8000.0, "pool_tau": 60.0},
+    "early": {"checkpoint_h": 36.0, "target_h": 120.0},
+    "late": {"checkpoint_h": 100.0, "target_h": 220.0},
+    "fast_refresh": {"refresh_lo": 0.75, "refresh_hi": 2.0},
+    "slow_refresh": {"refresh_lo": 6.0, "refresh_hi": 12.0},
+    "steep": {"earn_exp": 1.25, "tau_lo": 6.0, "tau_hi": 420.0},
+    "flat": {"earn_exp": 0.55, "tau_lo": 1.0, "tau_hi": 200.0},
+    "rare": {"a_lo": 0.001, "a_hi": 0.45},
+    "common": {"a_lo": 0.25, "a_hi": 0.995},
+    "surge": {"surge_h": 72.0, "surge_add": 50000.0},
+}
+
+
+def run_extended():
+    """The recalibration suite: every regime on tuning seeds (201-205) and held-out seeds (301-305)."""
+    print("== extended synthetic regimes (model only; tuning seeds 201-205, held-out 301-305) ==")
+    agg = {"tune": [], "hold": []}
+    for name, kw in REGIMES.items():
+        line = f"{name:12s}"
+        for split, seeds in (("tune", range(201, 206)), ("hold", range(301, 306))):
+            scores, cover = [], []
+            for seed in seeds:
+                case, truth = synth_world_x(seed, **kw)
+                fc = model.forecast_case(case)
+                check_format(fc, case)
+                scores.append(pinball_loss(fc, case, truth))
+                rows = {r["id"]: r["q"] for r in fc["trophies"]}
+                cover.append(sum(1 for i, tr in enumerate(case["trophies"])
+                                 if rows[tr["id"]][0] <= truth[i] <= rows[tr["id"]][4]) / len(case["trophies"]))
+            mean = sum(scores) / len(scores)
+            agg[split].append(mean)
+            line += f" | {split} {mean:.4f} (cov {sum(cover) / len(cover):.2f})"
+        print(line)
+    print(f"mean over regimes: tune {sum(agg['tune']) / len(agg['tune']):.4f} | "
+          f"hold {sum(agg['hold']) / len(agg['hold']):.4f}")
+
+
 def edge_tests():
     """Malformed and boundary cases: the forecaster must always return a contract-valid forecast."""
     print("== edge cases ==")
@@ -303,4 +412,5 @@ def edge_tests():
 if __name__ == "__main__":
     run_practice()
     run_synthetic()
+    run_extended()
     edge_tests()
